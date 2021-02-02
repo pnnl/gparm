@@ -12,6 +12,13 @@ inputs.
 want.  In Linux, it should probably go in a bin file somewhere (e.g.,
 /usr/local/bin or ~me/bin).
 
+You will need a working version of Perl 5 on your machine, and may need to
+add two modules to your Perl installation if they aren't part of the distribution
+you're using:
+
+* Text::Template
+* Parallel::ForkManager
+
 # Running *gparm*
 
 To do parametric analysis with *gparm*, create two files:  1) a template
