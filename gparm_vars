@@ -1,0 +1,141 @@
+#!/usr/bin/perl -w
+
+# Simple script to read through a Text::Template template and
+# dump out a list of variables contained therein.  This is a
+# utility to help in development of gparm inputs.
+
+# For now anyway, just read everything and dump to stdout...
+
+# I'm really only interested in the keys, but may use the counts
+# someday.  Also, I keep a separate list of the lexical variables
+# (the 'my' variables) and function references so I can exclude
+# them from the output if desired...
+
+# $Id: gparm_vars,v 1.4 2009/03/18 14:55:42 d3a061 Exp $
+#
+# $Log: gparm_vars,v $
+# Revision 1.4  2009/03/18 14:55:42  d3a061
+# Stripped leading/trailing spaces off parm variable names and added quote
+# characters around printed variable names.
+#
+# Revision 1.3  2009/03/17 21:10:45  d3a061
+# Fixed bug that was returning a ref to an empty list instead of just the empty list.
+#
+# Revision 1.2  2009/03/17 20:51:35  d3a061
+# Added ability to compare template variables with parmfile variables.
+#
+
+use Getopt::Std;
+
+my %OPT;
+getopts('p:', \%OPT);
+my $parmfile = $OPT{p} || '';
+my %parmvarcount = count_parm_vars($parmfile);
+
+
+my(%varcount, %myvarcount, %funcrefcount);
+
+##################################################################
+# Place here the list of variables we don't want to know about....
+##################################################################
+@nokeep = qw($_ $OUT);
+
+while ( <> ) {
+
+	# I'm just listing every scalar variable I find, without regard
+	# to whether it's a template variable or a locally-defined (e.g.,
+	# 'my') variable or something in a comment...
+
+	$varcount{$1}++   while m/(\$:{0,2}[a-zA-Z][\w]*)/g;
+	$myvarcount{$1}++ while m/my\s*(\$:{0,2}[a-zA-Z][\w]*)/g;
+	$funcrefcount{$1}++ while m/(\$:{0,2}[a-zA-Z][\w]*)\s*->/g;
+}
+
+# Just print 'em out.  Skip any
+# varnames I know I don't want...
+@my = keys %myvarcount;
+@funcref = keys %funcrefcount;
+
+print "Globals:\n";
+foreach my $var ( sort(keys(%varcount)) ) {
+	next if any_match($var, \@nokeep);
+	next if any_match($var, \@my);
+	next if any_match($var, \@funcref);
+	print "$varcount{$var}\t'$var'\n";
+}
+
+if ($parmfile) {
+	print "\nParm Variables:\n";
+	foreach my $var ( sort(keys(%parmvarcount)) ) {
+		print "$parmvarcount{$var}\t'$var'\n";
+	}
+
+	print "\nUnused Parm Variables:\n";
+	foreach my $var ( sort(keys(%parmvarcount)) ) {
+		print "\t'$var'\n" unless exists $varcount{'$'.$var} || $var eq 'ID';
+	}
+
+	print "\nGlobals not in Parm File:\n";
+	foreach my $var ( sort(keys(%varcount)) ) {
+		(my $pvar = $var) =~ s/^\$//;
+		print "\t'$var'\n" unless exists $parmvarcount{$pvar} || any_match($var, \@nokeep);
+	}
+}
+
+print "\nLexicals:\n";
+foreach my $var ( sort(keys(%myvarcount)) ) {
+	next if any_match($var, \@nokeep);
+	print "$myvarcount{$var}\t'$var'\n";
+}
+print "\nFunction refs:\n";
+foreach my $var ( sort(keys(%funcrefcount)) ) {
+	next if any_match($var, \@nokeep);
+	print "$funcrefcount{$var}\t'$var'\n";
+}
+
+
+
+
+sub any_match {
+	my $first    = shift;
+	my $ref2rest = shift;
+	for ( @$ref2rest ) {
+		return 1 if $first eq $_;
+	}
+	return 0;
+}
+
+
+sub count_parm_vars {
+	my $parmfile = shift or return;
+
+	open(P, $parmfile) or die "Couldn't open $parmfile for reading: $!";
+
+	# Find first row (after skipping comments)...
+	my $line;
+	while (defined($line = <P>)) {
+		chomp $line;
+		$line =~ s/#.*//;
+		next if $line =~ /^\s*$/;
+		last;
+	}
+	close P;
+	return unless $line;
+
+	my @vars = split(',', $line, -1);
+	@vars = map {no_lead_trail($_)} @vars;
+	my %count;
+	for my $var (@vars) {
+		$count{$var}++;
+	}
+
+	return %count;
+}
+
+
+sub no_lead_trail {
+	my $str = shift;
+	$str =~ s/^\s*//;
+	$str =~ s/\s*$//;
+	$str;
+}

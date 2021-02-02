@@ -1,0 +1,984 @@
+#!/usr/bin/env perl
+
+# gparm is a simple script that combines a text template containing
+# replaceable parameters with parameter definitions taken from a
+# rectangular csv file.
+#
+# gparm's capabilities are mostly defined by those of the Text::Template
+# module, which is recommended reading before editing this script.
+#
+# The logic is essentially linear--so read from top to bottom--but the
+# multiprocessing capability uses recursive calls to the whole script.
+
+use English;
+use warnings;
+use strict 'vars';
+use Text::Template;		# The real smarts of gparm
+
+use Getopt::Long qw/GetOptions/;	# Allows both long and short switches (e.g., -i or --infile) and
+Getopt::Long::Configure qw/gnu_getopt/;	# multiple use of the same switch (see -s or --set below)
+
+use POSIX;			# ceil and floor functions
+use Data::Dumper;		# Allows use of Dumper in templates for debugging
+use Scalar::Util;		# looks_like_number function
+use Parallel::ForkManager;	# Multiprocessing
+{
+	# We avoid a straight "use" here to avoid redefinition warnings for
+	# the trig functions imported into gparm.
+	local $WARNING = 0;
+	require Math::Trig;
+	import Math::Trig;
+}
+
+# A couple of important globals that hold, respectively, the data for each
+# filled-in template and an error code in case of a failure duing fill-in.
+use vars qw($GPARM_PKG $GPARM_ERROR %GPARM_DATA);
+
+
+
+BEGIN {
+	# Set up a package (a symbol table) to hold all the values
+	# filled in by the template system.  We give this a reasonable
+	# name in case anyone needs to use it in a complex template
+	# (however unlikely that is).
+	$GPARM_PKG = 'GPARM';
+}
+
+# Setup
+my $QWAIT = '/qfs/projects/BECP/bin/qwait';
+
+
+# ---------------------------------------
+# Command-line processing
+# ---------------------------------------
+
+# Declare command-line options and defaults (as applicable)
+
+# Options taking values
+my $initial_code;			# A Perl snippet to add to the top of the template (default none)
+my $parm_file;				# Mandatory option
+my $template_file;			# Mandatory option
+my $output_dir		= '.';		# Where generated files will be put
+my $output_file_mask	= '{}';		# The {} gets replaced with the value of the ID parameter
+my $nprocesses		= 1;		# For multiprocessing (on a single host)
+my $open_string		= '{';		# Open delimiter for Perl snippets in template files
+my $close_string	= '}';		# Close delimiter for Perl snippets in template files
+my $ref_print		= 'no';		# Whether to print reference vars in globals_report
+
+my %cmdline_parms;			# Parameter values added on the command line (equivalent to
+					# a parameter in the parmfile with the same value on ALL rows)
+# Flags (options without values)
+my $do_zip;				# Whether to compress generated filels (default false)
+
+GetOptions(
+
+	# Basic single-valued options
+	'initial-code|i=s'		=>	\$initial_code,
+	'parm-file|p=s'			=>	\$parm_file,
+	'template-file|t=s'		=>	\$template_file,
+	'output-dir|d=s'		=>	\$output_dir,
+	'output-file_mask|f=s'		=>	\$output_file_mask,
+	'nprocesses|n=s'		=>	\$nprocesses,
+	'open-string|o=s'		=>	\$open_string,
+	'close-string|c=s'		=>	\$close_string,
+	'ref-print|r=s'			=>	\$ref_print,
+
+	# Multivalued option
+	'set|s=s'			=>	\%cmdline_parms,	# E.g., --set parm1=value1 -s parm2=value2
+
+	# Flags
+	'do-zip|z'			=>	\$do_zip,
+
+) or die usage();
+
+# The template and parmfile are mandatory
+die usage() unless ($template_file && $parm_file);
+
+# We'll want the names of the command line-defined parms (from the -s/--set switch) for later
+my @cmdline_parm_names = ();
+@cmdline_parm_names = keys(%cmdline_parms) if %cmdline_parms;
+
+
+# Set up file compression
+my($zip, $zip_ext);
+if ( $do_zip ) {
+	if ( $OSNAME =~ /MSWin32/i ) {
+		warn "Compression not available on $OSNAME";
+
+	} elsif ( $OSNAME =~ /darwin/i ) {
+		# Does the Mac OS X reliably have gzip?  Not sure, so not implementing it here.
+		warn "Compression not available on $OSNAME";
+
+	} else {
+		# Expect virtually any other OS to be some kind of Unix or Linux variant, so
+		# the only question is where to find the gzip executable
+		$zip = -e '/bin/gzip' ? '/bin/gzip -9' : -e '/usr/bin/gzip' ? '/usr/bin/gzip -9' : undef;
+
+		if ($zip) {
+			$zip = '/bin/gzip -9';
+			$zip_ext = '.gz';	# In case we ever add bzip2, etc.
+		} else {
+			warn "Can't find gzip executable; file compression not activated";
+		}
+	}
+}
+
+# Make sure the filemask is legal (has the two-character string '{}' somewhere
+# in it).  That string can occur more than once.  The {} will get replaced by
+# the value of the ID variable for each file created.
+#
+die "Illegal output file mask ($output_file_mask)...it should have {} somewhere in it."
+	unless $output_file_mask =~ /\{\}/;
+
+
+# ---------------------------------------
+# End command-line processing
+# ---------------------------------------
+
+
+
+# Go ahead and create the template objects; We're trying to fail early.
+
+my $MAIN_TEMPLATE;
+if ($initial_code) {
+	$MAIN_TEMPLATE = Text::Template->new(
+		TYPE		=> ARRAY,
+		SOURCE		=> template_with_initial_code($template_file),
+		DELIMITERS	=> [$open_string, $close_string],
+		PREPEND		=> 'use English;'
+	) || die "Trouble creating Template object from <$template_file>";
+} else {
+	$MAIN_TEMPLATE = Text::Template->new(
+		TYPE		=> FILE,
+		SOURCE		=> $template_file,
+		DELIMITERS	=> [$open_string, $close_string],
+		PREPEND		=> 'use English;'
+	) || die "Trouble creating Template object from <$template_file>";
+}
+
+
+# Open the parm file and read down to the first non-comment line
+# to discover the variable names.  Note that we leave the PARM handle
+# open so we can grab the data lines later without having to skip over
+# the header.
+if ($parm_file eq '-') {
+	open(PARM, "<&STDIN") or die "Couldn't dup STDIN: $!";
+} else {
+	open(PARM, $parm_file) || die "Couldn't open parm file <$parm_file>: $!";
+}
+my $line;
+while ( defined($line = <PARM>) ) {
+
+	# Deal with non-Unix text files
+	$line =~ s/\r([^\n])/\n$1/g;	# Convert Mac line endings to Unix
+	$line =~ s/\r$//g;  		# Convert Win/DOS line endings to Unix
+
+	chomp $line;
+	$line =~ s/#.*$//;		# Ax comments
+	last unless $line =~ /^\s*$/;
+}
+
+
+# NOTE:  The term 'field' is used below to refer to the field names from the
+# csv parameter file.  Think of fields as parameter names or values as the
+# case may be.
+
+# The stripping off of '*', '$', and '@' was originally for backward compatibility
+# with a primitive precursor to gparm...could probably be eliminated now.
+my @field_names = map { s/[*$@]$//; $_ } split(/,/, $line, -1);
+
+foreach (@field_names) {
+	# Trim off whitespace
+	s/^\s*//;
+	s/\s*$//;
+}
+
+
+# Now that we know the field names, we'll check them against any parameters
+# given on the command-line (the -s or --set option) and warn the user if
+# there are any overrides:
+if (%cmdline_parms) {
+	foreach my $key (keys %cmdline_parms) {
+		if (in_set($key, @field_names)) {
+			print STDERR "NOTE: Parameter '$key' set on command line overrides values from parameter file\n";
+		}
+	}
+}
+
+
+# If there's a field named 'ID', we use it build the output filename.
+# We pre-fill the whole USER_FIELDS hash with default values so that
+# we can test for that field.
+my(%USER_FIELDS, $ID_field_name);
+@USER_FIELDS{@field_names} = @field_names;  # brainless initialize (will get overwritten below)
+if ( $USER_FIELDS{'ID'} ) {
+	$ID_field_name = 'ID';
+} else {
+	$ID_field_name = $field_names[0];  # Default to first column
+}
+
+
+# The %ADMIN_FIELDS hash holds some "administrative" stuff that's useful to the
+# user but needs to be kept separate from the the user's fields.
+
+my %ADMIN_FIELDS;
+
+# Info about the replaceable fields
+$ADMIN_FIELDS{'FIELD_NAMES'}	= ();			# This gets filled in down below
+$ADMIN_FIELDS{'FIELDS'}		= \%USER_FIELDS;
+
+# Functions for nested templates
+$ADMIN_FIELDS{'include'}	= \&include;
+$ADMIN_FIELDS{'process'}	= \&process;
+
+# Export some handy functions users might need in their templates
+#
+
+$ADMIN_FIELDS{'in_set'}		= \&in_set;  # Does the first argument appear in the others?
+
+$ADMIN_FIELDS{'ceil'}		= \&POSIX::ceil;
+$ADMIN_FIELDS{'floor'}		= \&POSIX::floor;
+
+$ADMIN_FIELDS{'round'}		= \&round;
+$ADMIN_FIELDS{'signif'}		= \&signif;
+
+$ADMIN_FIELDS{'is_numeric'}	= \&Scalar::Util::looks_like_number;
+
+$ADMIN_FIELDS{'fmt'}		= \&fmt;
+$ADMIN_FIELDS{'fmt_indented'}	= \&fmt_indented;
+
+$ADMIN_FIELDS{'min'}		= \&min;
+$ADMIN_FIELDS{'max'}		= \&max;
+
+$ADMIN_FIELDS{'sin'}		= \&Math::Trig::sin;
+$ADMIN_FIELDS{'tan'}		= \&Math::Trig::tan;
+$ADMIN_FIELDS{'asin'}		= \&Math::Trig::asin;
+$ADMIN_FIELDS{'acos'}		= \&Math::Trig::acos;  # cos is already in CORE
+$ADMIN_FIELDS{'atan'}		= \&Math::Trig::atan;
+$ADMIN_FIELDS{'pi'}		= \&Math::Trig::pi;
+$ADMIN_FIELDS{'deg2rad'}	= \&Math::Trig::deg2rad;
+$ADMIN_FIELDS{'rad2deg'}	= \&Math::Trig::rad2deg;
+$ADMIN_FIELDS{'dsin'}		= sub{ sin(deg2rad($_[0])) };  # Takes degrees instead of radians
+$ADMIN_FIELDS{'dcos'}		= sub{ cos(deg2rad($_[0])) };  #                "
+$ADMIN_FIELDS{'dtan'}		= sub{ tan(deg2rad($_[0])) };  #                "
+$ADMIN_FIELDS{'dasin'}		= sub{ rad2deg(asin($_[0])) };  # Returns degrees instead of radians
+$ADMIN_FIELDS{'dacos'}		= sub{ rad2deg(acos($_[0])) };  #               "
+$ADMIN_FIELDS{'datan'}		= sub{ rad2deg(atan($_[0])) };  #               "
+
+$ADMIN_FIELDS{'deep_copy'}	= \&deep_copy;
+
+$ADMIN_FIELDS{'Dumper'}		= \&Data::Dumper::Dumper;
+
+# Two functions for giving parameters default values in the template file.
+# The val_or function is useful in rare cases when Perl's "symbolic references"
+# are needed in a template.  Otherwise, setdef is the primary way to set defaults.
+#
+$ADMIN_FIELDS{'or_default'}	=
+$ADMIN_FIELDS{'value_or'}	=
+$ADMIN_FIELDS{'val_or'}		= sub { my $val = shift; my $default = shift; defined $val && $val ne "" ? $val : $default };
+
+$ADMIN_FIELDS{'set_default'} = $ADMIN_FIELDS{'setdef'} = sub {
+
+	# Call like
+	#
+	#     set_default($x, $default) or
+	#
+	#     setdef($x, $default)
+	#
+	# to set the value of $x to its default value ($default)
+	# UNLESS $x is already defined AND is not the empty string.
+
+	unless ( defined $_[0] && $_[0] ne '' ) {
+		$_[0] = $_[1];
+	}
+	return $_[0];
+};
+$ADMIN_FIELDS{'globals'} = sub {
+	# Deep magic function to return a hashref of all global scalar
+	# variables known to gparm (in the GPARM:: package) at the time
+	# it is called.  Typically, this would be called at the top of
+	# a template to store away the list of known variables (which includes
+	# all variables given in the parmfile as well as other globals
+	# known to gparm); then called again at the end of the template
+	# to see if any parm variables were modified or added by the
+	# template.  Useful primarily for debugging, because there's no
+	# way to force "declaration" of parm variables.  Typically used
+	# in conjunction with the 'globals_report' function below.
+
+	# We'll create a copy of the GPARM globals, scalars only
+	my %ans;
+
+	no strict;
+	local (*alias);
+	*stash = *{"GPARM::"};	# Symbol table hash
+
+	# Loop over the symbol table entries, grabbing a copy of each
+	# defined scalar.  We skip all non-scalar variables (arrays, hashes,
+	# functions, filehandles).
+	while ( ($var_name, $glob_value) = each %stash ) {
+		*alias = $glob_value;
+		if (defined($alias)) {
+			$ans{$var_name} = $alias;
+		}
+	}
+
+	\%ans;
+};
+$ADMIN_FIELDS{'globals_report'} = sub{
+	# Expects two hashrefs.  The first should generally be a table of globals
+	# from the top of a template; the second a table of globals at the bottom
+	# of a template, to represent the state after all filling in is done.
+	# (See globals function above.)
+	#
+	# Because this reports only new variables and variables whose value has
+	# been changed by the template, it will mostly list only parm variables
+	# and variables that should have been lexically scoped.
+
+	my $href1 = shift or die;	# Should be value of globals() call at top of template
+	my $href2 = shift or die;	# Should be value of globals() call at bottom of template
+
+	my $prefix = shift || '! ';	# Comment character...default '! ' is EnergyPlus's comment marker
+
+	my $ans = $prefix .	"=====================================================\n";
+	$ans .=	$prefix .	"          Report on template variables\n";
+	$ans .= $prefix . "\n";
+	$ans .= $prefix . "-----------------------------\n";
+	$ans .= $prefix . "Variables changed in template:\n";
+	$ans .= $prefix . "-----------------------------\n";
+	$ans .= $prefix . "\n";
+	for my $key (sort keys %$href1) {
+		if ($href1->{$key} ne $href2->{$key}) {
+			$ans .= $prefix . "$key:  '$href1->{$key}' --> '$href2->{$key}'\n";
+		}
+	}
+
+	# Convenience function
+	my $new_in_2nd_list = sub {
+		my $list1 = shift or die;
+		my $list2 = shift or die;
+	
+		my @ans;
+		my %href1;
+		$href1{$_} = 1 foreach @$list1;
+		for my $item (@$list2) {
+			push @ans, $item unless $href1{$item};
+		}
+		return @ans;
+	};
+	my @new = $new_in_2nd_list->([keys %$href1], [keys %$href2]);
+
+	$ans .= $prefix . "\n";
+	$ans .= $prefix . "---------------------------------\n";
+	$ans .= $prefix . "New variables created in template:\n";
+	$ans .= $prefix . "---------------------------------\n";
+	$ans .= $prefix . "\n";
+
+	# Try to separate out scalars that are refs to other things, as these
+	# are not likely candidates for new parm variables.
+	my(@plain_varnames, @ref_varnames);
+	for my $key (sort @new) {
+		my $val = $href2->{$key};
+		if ($val =~ /(ARRAY|GLOB|CODE|HASH)\(0x/) {
+			push @ref_varnames, $key;
+		} else {
+			push @plain_varnames, $key;
+		}
+	}
+	for my $key (@plain_varnames) {
+		$ans .= $prefix . "$key:  '$href2->{$key}'\n";
+	}
+	$ans .= $prefix . "\n";
+
+	if ($ref_print =~ /(yes|true)/i) {
+		for my $key (@ref_varnames) {
+			$ans .= $prefix . "$key:  '$href2->{$key}'\n";
+		}
+	}
+	$ans .= $prefix .	"=====================================================\n";
+
+	$ans;
+};
+
+
+# A hash where users can store persistent data.  Any data stored therein
+# should be given its own user-preferred name in the persistent hash
+# and the template should have a check to see that it doesn't get loaded
+# more than once.
+#
+# For example:
+#
+# 	{
+# 		unless ($DATA{materials}) {
+# 			$DATA{materials} = << Code to read materials data >>
+# 		} else {
+# 			# Nothing to do
+# 		}
+# 	}
+#
+%GPARM_DATA	= ();
+$ADMIN_FIELDS{'DATA'}		= \%GPARM_DATA;
+
+# And a function to read a simple CSV file into a hasref so it can
+# be stored in the persistent data area.  E.g., for data in a CSV:
+#
+# 	key1,key2,value
+# 	roof,zone1,30
+# 	roof,zone8,60
+# 	wall,zone1,13
+# 	wall,zone8,21
+#
+# 	$DATA{mydataname} = hashref_from_simple_csv("mydata.csv")
+#
+# Then access the result something like
+#
+# 	$r_value = $DATA{mydataname}{$key1}{$key2}
+# or
+# 	$r_value = $DATA{mydataname}{roof}{zone8}
+#
+$ADMIN_FIELDS{'hashref_from_simple_csv'} = sub {
+
+# -----------------------------------------------
+# Function definition.  This is now built in to the gparm program,
+# but you can use it as a pattern for your own functions if you have
+# different CSV formats or want to store the results in a different
+# Perl format.  You'd probably include the function definition
+# in a separate subtemplate to be loaded with the 'include' directive.
+# -----------------------------------------------
+
+	# This will load the contents of any csv file formatted like this:
+	#
+	#	key1,key2,key3...keyN,value
+	#
+	# and store it in the persistent gparm DATA hash.  You'd then access
+	# the data elsewhere in the template like:
+	#
+	# 	my $data = $DATA{lpd}{key1}{key2}{key3}
+
+	use Text::CSV;
+
+	# The function takes one argument:
+	my $csvfile	= shift or die;	# Name of the CSV file to read
+
+
+	# Instantiate a CSV object and open the CSV file for reading
+	my $csv = Text::CSV->new();
+	open my $handle, "<", $csvfile or die "Couldn't open $csvfile for reading:  $!";
+
+	# Grab the header row.  You probably don't need this because you don't
+	# really use them in the template as far as I can tell.  You do need to
+	# read them to get them out of the way, though.  And you can use it to
+	# count the number of keys if you want.
+	my @headers = @{ $csv->getline($handle) } or die "No data in $csvfile";
+	my $ncol = @headers;	# An array in scalar context returns the array length
+
+	# Loop over the CSV file, storing the final value in a hash indexed by the keys 
+
+	my %hash;	# The eventual return value
+	while (my $row = $csv->getline($handle)) {
+
+		# We want to build a command string that looks like the following
+		# (the example has 3 keys and 1 value)...
+		#
+		#	$hash{$row->[0]}{$row->[1]}{$row->[2]} = $row->[3];
+		#
+		# ...and then run it with 'eval'.  We have to build the string because
+		# we don't know until we're called how many columns are in the CSV file.
+
+		my(@keyparts) = map {"{\$row->[$_]}"} 0..($ncol-2);
+		my $valuepart = " = \$row->[$ncol-1]";
+		my $cmd = '$hash' . join('', @keyparts) . $valuepart;
+		eval $cmd;
+
+	}
+
+	return \%hash;
+};
+
+
+# Okay, we're ready to run.
+
+
+# We're going to read the entire parm file at once so we can easily
+# break it up into separate chunks to be handled by separate forked
+# processes.
+
+my @parms; chomp(@parms = <PARM>);	# <-- Each element is a CSV row from the parmfile
+close(PARM);
+
+# Do cleanup on the parameter file
+s/#.*//					foreach @parms;		# Strip out comments
+@parms = grep(!/^\s*$/, @parms);				# Toss blank lines
+s/\r([^\n])/\n$1/g			foreach @parms;		# Convert Mac line endings to Unix
+s/\r$//g				foreach @parms;		# Convert Win/DOS line endings to Unix
+
+
+# Be a little chatty if we're multiprocessing
+print STDERR "There are ", scalar(@parms), " rows to process with $nprocesses jobs\n" unless $nprocesses == 1;
+
+
+# Break parmfile up into $nprocesses parts
+my @parmrefs = @{ parmrefs(\@parms, $nprocesses) };	# Array of refs to arrays of CSV rows
+undef @parms;  # Free a little memory
+
+
+# Move through the rest of the parm file, creating an output file named
+# by the $ID_file_name, and executing the command on it each time.
+my($template_success, $command_text, $outfile, $open_okay);
+my @values;
+my $forker = Parallel::ForkManager->new($nprocesses);
+for my $i (0..$#parmrefs) {
+
+	# Grab one chunk of the parmfile
+	my $parmref = $parmrefs[$i];
+
+	my $pid = $forker->start and next;
+
+	# We are now in the child process, working on that chunk...
+
+	PARMROW: foreach my $line (@$parmref) {
+
+		chomp $line;
+
+		# Break input into fields
+		@values = split(/,/, $line, -1);
+		unless ( @values == @field_names ) {
+			my $n_expected = @field_names;
+			my $n_got      = @values;
+			warn "Expected $n_expected fields, got $n_got.  Skipping this row of $parm_file:\n$line\n";
+			next PARMROW;
+		}
+
+
+		# Now make the field names and values known to the template
+		@{$ADMIN_FIELDS{FIELD_NAMES}}	= @field_names;
+		@USER_FIELDS{@field_names}	= @values;
+
+		# Add/override parms given on the command-line
+		foreach my $cparm (@cmdline_parm_names) {
+
+			# The FIELD_NAMES: only add a command-line-given parm if it's not a parm from the parmfile
+			push @{$ADMIN_FIELDS{FIELD_NAMES}}, $cparm unless in_set($cparm, @field_names);
+
+			# The name/value HASH: overwrites existing parm if any, else creates a new parm therein
+			$USER_FIELDS{$cparm} = $cmdline_parms{$cparm};
+		}
+
+
+		# Open output file (the "generated file")
+		my $tmp = filename_from_ID($USER_FIELDS{$ID_field_name});
+
+		# I'm commenting out the legal_filename call, eliminating the long-available but
+		# rarely if ever used capability to automaticaly unique-ify output filenames.  From
+		# now (3/17/2015) on, it's up to the user to make sure the ID column has unique values.
+		#$outfile = legal_filename("$output_dir/$tmp");
+		$outfile = "$output_dir/$tmp";
+
+		$open_okay = zopen(\*OUT, $outfile, $zip, $zip_ext) or
+			warn "Couldn't create output file <$outfile>: $!";
+		next PARMROW unless $open_okay;
+
+
+		# Fill in the main template
+		$ADMIN_FIELDS{'IDFILE'} = $outfile;
+		$GPARM_ERROR = 0;
+		$template_success = $MAIN_TEMPLATE->fill_in(
+			HASH		=> [\%USER_FIELDS, \%ADMIN_FIELDS],
+			PACKAGE		=> $GPARM_PKG,
+			BROKEN		=> \&do_on_error,
+			BROKEN_ARG	=> \$GPARM_ERROR,
+			OUTPUT		=> \*OUT,
+		);
+		die "Trouble filling in template" unless $template_success;
+
+		close(OUT) or die "Trouble closing output file <$outfile>: $!";
+
+		if ( $GPARM_ERROR ) {
+			print STDERR "FAILED filling in main template on row $. of parm file\n";
+			print STDERR "Take a look in $outfile for more information\n";
+			die;
+		}
+
+		# Avoid this row's parm values leaking forward to the next row (mainly concerned
+		# that we don't break dynamic defaults).
+		clear_fill_in_package();
+
+	}
+	$forker->finish();	# Child process is done
+}
+$forker->wait_all_children();
+
+exit;
+
+# ************************** End of main script ********************************
+
+
+sub zopen {
+
+	my($fh, $file, $zip, $zip_ext) = @_;
+
+	if ( $zip ) {
+		$file = "| $zip >" . $file . $zip_ext;
+	} else {
+		$file = ">$file";
+	}
+	open($fh, $file);
+}
+
+
+
+
+sub usage {
+<<EOF;
+
+Usage:  $0  -t template.file -p parm.file [-o open_string] [-c close_string] \\
+            [-d directory] [-f filemask] [-i initial_code] [ -z ]            \\
+            [-n nprocesses] [-r yes] [-s parm=value [-s parm2=value2 [...]]]
+
+   template.file - The main template file to be filled in repeatedly (row by
+                   row from the parm.file).  The "tags" within this file are
+                   just Perl code snippets inside pairs of curly braces {}.
+                   Any variables defined in the parm.file are replaced by
+                   their values in each filled-in file.
+
+   parm.file	 - A columnar file with fields separated by commas that
+		   defines, one set per row, the values to fill in to
+		   the template.file.  The first non-comment row must be
+		   the column names.  There should be one column named 'ID'
+		   that is unique for every row.  If there is no 'ID' column,
+		   the first column is used for output filenames, with numeric
+		   suffixes added to any repeated names.  The parm.file name
+		   can be "-", in which case gparm reads STDIN.
+
+   open_string,  - The strings to be used as delimiters for the embedded Perl
+   close_string    code.  Defaults to '{' and '}', respectively.  Can be any
+                   pair of strings.  E.g., '[--' and '--]' or '(*' and '*)'
+
+   directory     - The directory into which the filled-in template files
+                   will be written.  Defaults to '.' (the current directory).
+                   The specified directory must already exist.
+
+   filemask      - A "pattern" for the filenames to be generated.  It must
+                   contain the string "{}", which will be substituted with
+                   the values from the ID column of the parm file.  E.g.,
+                   -f 'file.{}.input'
+
+   initial_code  - A Perl snippet to be inserted at the top of the template.
+                   E.g., -i 'use Some::Module'
+
+   nprocesses    - The number of processes to use.  This is handy on a
+                   multicore machine.  Defaults to 1.
+
+   -r            - Give a value of 'yes' or 'true' to print reference vars.
+
+   -z              If given, $0 compresses each generated file using gzip.
+
+   parm=value    - Add/modify a parameter via the command line.  The -s
+                   option can be entered multiple times.
+
+EOF
+}
+
+
+# Function to return a unique filename for each ID.  If the user
+# has properly given a unique ID field, this basically does nothing.
+# If not, this thing (a) makes sure the first character is alpha-numeric,
+# and (b) tacks on a
+# suffix if the resulting filename has been seen before (to avoid clobbering
+# files from earlier rows).
+{
+	my %FILENAME_SUFFIX;
+
+	sub legal_filename {
+		my $in_name = shift;
+		my $name = $in_name;
+		$name .= '.' . $FILENAME_SUFFIX{$in_name} if $FILENAME_SUFFIX{$in_name};
+		$FILENAME_SUFFIX{$in_name} = 1 unless $FILENAME_SUFFIX{$in_name};
+		++$FILENAME_SUFFIX{$in_name};  # lowest suffix will always be 2
+		$name;
+	}
+}
+
+#
+# Hooks back to the global $output_file_mask variable that gets set by
+# the -f option.  We set the output filename to be the output file mask with
+# any occurrences of the two-character string '{}' substituted with the
+# current $ID value.
+sub filename_from_ID {
+
+	my $id = shift;
+	defined($id) and $id ne '' or die 'Bad call to filename_from_ID';
+
+	my $filename = $output_file_mask;  # Reference to global data
+	$filename =~ s/\{\}/$id/g;
+	return $filename;
+}
+
+
+
+# For loading (and filling in) include/process files, we define hashes to cache the files'
+# content and/or parsed templates.  This avoids having to re-read them for every fill_in.
+{ # Bare scope
+	my %INCLUDED_TEMPLATE;
+	BEGIN {
+		%INCLUDED_TEMPLATE = ();
+	}
+
+	sub process {
+		my $file = shift;
+
+		if (!exists($INCLUDED_TEMPLATE{$file})) {
+			die "Couldn't find $file" unless -e $file;
+
+			$INCLUDED_TEMPLATE{$file} = Text::Template->new(
+				TYPE   => FILE,
+				SOURCE => $file,
+				DELIMITERS => [$open_string, $close_string]
+			) || die "Trouble creating Template object from included/processed file <$file>";
+
+		}
+
+		my $result = $INCLUDED_TEMPLATE{$file}->fill_in(
+#			HASH		=> [\%USER_FIELDS, \%ADMIN_FIELDS],  # Should the HASH argument be here?  (It wasn't originally, before this caching update)
+			PACKAGE		=> caller(),
+			DELIMITERS	=> [$open_string, $close_string],
+			BROKEN		=> \&do_on_error,
+			BROKEN_ARG	=> \$GPARM_ERROR
+		);
+
+		return $result;
+	}
+}
+
+{ # Bare scope
+	my %INCLUDED_FILE;
+	BEGIN{
+		%INCLUDED_FILE = ();
+	}
+
+	sub include {
+		my $file = shift;
+
+		if (!exists($INCLUDED_FILE{$file})) {
+			die "Couldn't find $file" unless -e $file;
+			$INCLUDED_FILE{$file} = Text::Template::_load_text($file);
+		}
+		return $INCLUDED_FILE{$file};
+	}
+}
+
+
+# For determining if a value is in a given target set
+sub in_set {
+	my $look_for = shift;
+	return 0 unless @_;
+	my @set = @_;
+	my $undef_is_in_set;
+	FINDUNDEF: for ( @set ) {
+		if ( !defined($_) ) {
+			$undef_is_in_set = 1;
+			last FINDUNDEF;
+		}
+	}
+	if (!defined($look_for)) {
+		return 1 if $undef_is_in_set;
+		return 0;
+	}
+	for ( @set ) {
+		return 1 if $_ eq $look_for;
+	}
+	return 0;
+}
+
+
+# For improved error processing
+sub do_on_error {
+	my %data = @_;
+	my $arg_ref = $data{arg};
+
+	++$$arg_ref;
+
+	return <<EOF;
+---------------------------------------------------------------
+ERROR $$arg_ref:
+    $data{error}
+
+The offending code fragment starts at about line $data{lineno}:
+$data{text}
+
+END ERROR $$arg_ref
+---------------------------------------------------------------
+EOF
+}
+
+
+
+sub parmrefs {
+	# Break an array up into $n parts
+
+	my @parms = @{ (shift) };
+	my $nprocesses = shift or die;
+
+	my @ans;  # Array of arrayrefs
+
+	foreach my $i (0..$#parms) {
+		push @{ $ans[$i % $nprocesses] }, $parms[$i];
+	}
+
+	return \@ans;
+}
+
+
+# ----------------
+# Here we define a bunch of utility functions that might be handy for
+# the user to use in the template file.
+# ----------------
+sub round {
+	# Round to a specified number of digits.  A negative number of digits
+	# will round to places left of the decimal point (e.g., -1 rounds to
+	# the nearest 10, -2 to the nearest 100, etc.)
+
+	my $value = shift or return;
+	my $nplaces = shift || 0;
+
+	my $factor = 10**$nplaces;
+
+	int($factor*$value + 0.5) / $factor;
+}
+
+
+sub signif {
+	# Round to a specified number of significant digits
+
+	my $value = shift or die;
+	my $digits = shift;
+	$digits = 4 unless defined $digits;
+
+	die "Can't produce less than 1 significant digit" unless $digits >= 1;
+
+	0 + sprintf '%.' . ($digits - 1) . 'e', $value;
+}
+
+
+
+sub fmt {
+	# Simple paragraph formatter (named after Unix's /usr/bin/fmt)
+	use Text::Wrap;
+
+	my $linewidth   = shift;
+	my @text        = @_ or return;
+
+	local $Text::Wrap::columns = $linewidth;
+	fill('', '', @text);
+}
+
+
+sub fmt_indented {
+	# Simple paragraph formatter (named after Unix's /usr/bin/fmt)
+	use Text::Wrap;
+
+	my $linewidth           = shift;
+	my $initial_indent      = shift;
+	my $remainder_indent    = shift;
+	my @text                = @_ or return;
+
+	local $Text::Wrap::columns = $linewidth;
+	fill($initial_indent, $remainder_indent, @text);
+}
+
+sub min {
+	my $min = shift;
+
+	for my $value (@_) {
+		$min = $value if $value < $min;
+	}
+	$min;
+}
+
+sub max {
+	my $max = shift;
+
+	for my $value (@_) {
+		$max = $value if $value > $max;
+	}
+	$max;
+}
+
+sub clear_fill_in_package {
+	# We want the template to be free to set/modify variables in the
+	# FILL_IN_PACKAGE without those new/changed values propagating to
+	# the next iteration (i.e., the next row of the parm file).
+	# This allows the template, for example, to set variables to
+	# default values if they're not given in the parm file, but not
+	# have those default values propagated to the next parm row.
+	#
+	# For example, say a parm file looks like this:
+	#
+	#   ID,length,width
+	#   1,10,20
+	#   2,100,200
+	#
+	# And the template looks like this:
+	#
+	# {
+	#   $volume ||= $length * $width * 8;  # Default volume if not given in parm file
+	#   <etc.>
+	# }
+	#
+	# If the user adds volume to the parm file, no harm done--it won't get
+	# reset by the code.  But if the user is letting volume take a "dynamic
+	# default" value based on length and width (and an assumed height), we
+	# don't want the fill_in to start with volume defined or we won't get
+	# the right default value.
+	#
+	# Therefore, this little function empties the main FILL_IN_PACKAGE of
+	# all values so they can start anew on the next fill_in.
+
+	my $symtable = "$GPARM_PKG" . '::';
+
+	foreach my $var (keys %{$symtable}) {
+		undef ${$symtable}{$var};
+	}
+
+	return;
+}
+
+
+# TODO:  Replace this hand-crafted deep_copy function with a simple reference to
+# the dclone function from the Storable module.  The latter is more than twice as
+# fast.  Not a big deal because no one ever uses deep_copy anyway.
+sub deep_copy {
+
+	my $this = shift;
+
+	if (not ref $this) {
+		$this;
+	} elsif (ref $this eq "ARRAY") {
+		[map deep_copy($_), @$this];
+	} elsif (ref $this eq "HASH") {
+		+{map { $_ => deep_copy($this->{$_}) } keys %$this};
+	} else {
+		die "what type is $_?" 
+	}
+}
+
+
+sub template_with_initial_code {
+	# Simply read the whole template into an array and tack
+	# the user's initial code (the -i option) onto the front of it.
+
+	my $file = shift or die;
+
+	open(F, $file) or die "Couldn't open $file for reading: $!";
+	my(@template_text) = <F>;
+	close(F);
+
+	if ($initial_code) {
+		# No newline between the pre_text and the first line of the
+		# user's template, so we don't insert an inappropriate blank line
+		# at the top of the generated file.
+		my $pre_text = $open_string . '$OUT=""; ' . $initial_code . ';' . $close_string;
+		$template_text[0] = $pre_text . $template_text[0];
+	}
+
+	return \@template_text;
+}
