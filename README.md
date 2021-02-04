@@ -1,4 +1,4 @@
-# *gparm* --- A Tool for General Parametrics
+# *gparm* -- A Tool for General Parametrics
 
 ## What is *gparm*?
 *gparm* is a program for generating oodles of text-based input files for other
