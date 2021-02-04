@@ -1,4 +1,4 @@
-# *gparm* --- A Tool for General Parametrics
+# *gparm* -- A Tool for General Parametrics
 
 ## What is *gparm*?
 *gparm* is a program for generating oodles of text-based input files for other
@@ -76,7 +76,7 @@ The parameter file is simply a CSV file holding a rectangular block of data,
 one column per parameter, one row per run set.  The first row holds the
 parameter names (as they're used in the template file).  E.g.,
 
-```commasep
+```
 	ID, iterations, use_fastlib, start_value
 	1, 12, yes, 1
 	2, 12, yes, 10
