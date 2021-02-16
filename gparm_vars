@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/env perl
 
 # Simple script to read through a Text::Template template and
 # dump out a list of variables contained therein.  This is a
@@ -25,6 +25,7 @@
 # Added ability to compare template variables with parmfile variables.
 #
 
+use warnings;
 use Getopt::Std;
 
 my %OPT;
