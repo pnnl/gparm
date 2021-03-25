@@ -417,83 +417,21 @@ $ADMIN_FIELDS{'globals_report'} = sub{
 #
 %GPARM_DATA	= ();
 $ADMIN_FIELDS{'DATA'}		= \%GPARM_DATA;
+$ADMIN_FIELDS{'read_json'} = sub {
+	use JSON;
 
-# And a function to read a simple CSV file into a hasref so it can
-# be stored in the persistent data area.  E.g., for data in a CSV:
-#
-# 	key1,key2,value
-# 	roof,zone1,30
-# 	roof,zone8,60
-# 	wall,zone1,13
-# 	wall,zone8,21
-#
-# 	$DATA{mydataname} = hashref_from_simple_csv("mydata.csv")
-#
-# Then access the result something like
-#
-# 	$r_value = $DATA{mydataname}{$key1}{$key2}
-# or
-# 	$r_value = $DATA{mydataname}{roof}{zone8}
-#
-$ADMIN_FIELDS{'hashref_from_simple_csv'} = sub {
+	my $json_filename = shift or die;
 
-# -----------------------------------------------
-# Function definition.  This is now built in to the gparm program,
-# but you can use it as a pattern for your own functions if you have
-# different CSV formats or want to store the results in a different
-# Perl format.  You'd probably include the function definition
-# in a separate subtemplate to be loaded with the 'include' directive.
-# -----------------------------------------------
+	my $json_text = do {
+	 open(my $json_fh, "<:encoding(UTF-8)", $json_filename)
+	    or die("Can't open \$lpd_filename\": $!\n");
+	 local $/;
+	 <$json_fh>
+	};
 
-	# This will load the contents of any csv file formatted like this:
-	#
-	#	key1,key2,key3...keyN,value
-	#
-	# and store it in the persistent gparm DATA hash.  You'd then access
-	# the data elsewhere in the template like:
-	#
-	# 	my $data = $DATA{lpd}{key1}{key2}{key3}
-
-	use Text::CSV;
-
-	# The function takes one argument:
-	my $csvfile	= shift or die;	# Name of the CSV file to read
-
-
-	# Instantiate a CSV object and open the CSV file for reading
-	my $csv = Text::CSV->new();
-	open my $handle, "<", $csvfile or die "Couldn't open $csvfile for reading:  $!";
-
-	# Grab the header row.  You probably don't need this because you don't
-	# really use them in the template as far as I can tell.  You do need to
-	# read them to get them out of the way, though.  And you can use it to
-	# count the number of keys if you want.
-	my @headers = @{ $csv->getline($handle) } or die "No data in $csvfile";
-	my $ncol = @headers;	# An array in scalar context returns the array length
-
-	# Loop over the CSV file, storing the final value in a hash indexed by the keys 
-
-	my %hash;	# The eventual return value
-	while (my $row = $csv->getline($handle)) {
-
-		# We want to build a command string that looks like the following
-		# (the example has 3 keys and 1 value)...
-		#
-		#	$hash{$row->[0]}{$row->[1]}{$row->[2]} = $row->[3];
-		#
-		# ...and then run it with 'eval'.  We have to build the string because
-		# we don't know until we're called how many columns are in the CSV file.
-
-		my(@keyparts) = map {"{\$row->[$_]}"} 0..($ncol-2);
-		my $valuepart = " = \$row->[$ncol-1]";
-		my $cmd = '$hash' . join('', @keyparts) . $valuepart;
-		eval $cmd;
-
-	}
-
-	return \%hash;
+	my $hashref = decode_json $json_text;
+	return $hashref;
 };
-
 
 # Okay, we're ready to run.
 
