@@ -489,11 +489,27 @@ $ADMIN_FIELDS{'hashref_from_simple_csv'} = sub {
 		my $cmd = '$hash' . join('', @keyparts) . $valuepart;
 		eval $cmd;
 
+
 	}
 
 	return \%hash;
 };
 
+$ADMIN_FIELDS{'read_json'} = sub {
+	use JSON;
+
+	my $json_filename = shift or die;
+
+	my $json_text = do {
+	 open(my $json_fh, "<:encoding(UTF-8)", $json_filename)
+	    or die("Can't open \$lpd_filename\": $!\n");
+	 local $/;
+	 <$json_fh>
+	};
+
+	my $hashref = decode_json $json_text;
+	return $hashref;
+};
 
 # Okay, we're ready to run.
 
