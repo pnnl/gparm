@@ -11,7 +11,7 @@ inputs.
 ## Installing *gparm*
 
 *gparm* is Perl script embodied in a single file.  Put it wherever you
-want.  In Linux, it should probably go in a bin file somewhere (e.g.,
+want.  In Linux, it should probably go in a bin directory somewhere (e.g.,
 /usr/local/bin or $HOME/bin).
 
 You will need a working Perl 5 interpreter on your machine, and may need to
