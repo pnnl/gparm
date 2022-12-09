@@ -230,6 +230,7 @@ $ADMIN_FIELDS{'FIELDS'}		= \%USER_FIELDS;
 # Functions for nested templates
 $ADMIN_FIELDS{'include'}	= \&include;
 $ADMIN_FIELDS{'process'}	= \&process;
+$ADMIN_FIELDS{'proc_str'}	= \&proc_str;
 
 # Export some handy functions users might need in their templates
 #
@@ -754,6 +755,36 @@ sub filename_from_ID {
 		}
 
 		my $result = $INCLUDED_TEMPLATE{$file}->fill_in(
+#			HASH		=> [\%USER_FIELDS, \%ADMIN_FIELDS],  # Should the HASH argument be here?  (It wasn't originally, before this caching update)
+			PACKAGE		=> caller(),
+			DELIMITERS	=> [$open_string, $close_string],
+			BROKEN		=> \&do_on_error,
+			BROKEN_ARG	=> \$GPARM_ERROR
+		);
+
+		return $result;
+	}
+}
+
+# For a string that contains Perl snippets within delimeters'
+# This can occur when reading text from a json data file.
+{ # Bare scope
+	my %INCLUDED_TEMPLATE;
+	BEGIN {
+		%INCLUDED_TEMPLATE = ();
+	}
+
+	sub proc_str {
+		my $str_to_proc = shift;
+
+		$INCLUDED_TEMPLATE{$str_to_proc} = Text::Template->new(
+			TYPE   => STRING,
+			SOURCE => $str_to_proc,
+			DELIMITERS => [$open_string, $close_string]
+		) || die "Trouble creating Template object from included/processed file <$str_to_proc>";
+
+
+		my $result = $INCLUDED_TEMPLATE{$str_to_proc}->fill_in(
 #			HASH		=> [\%USER_FIELDS, \%ADMIN_FIELDS],  # Should the HASH argument be here?  (It wasn't originally, before this caching update)
 			PACKAGE		=> caller(),
 			DELIMITERS	=> [$open_string, $close_string],
