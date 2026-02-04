@@ -503,7 +503,7 @@ $ADMIN_FIELDS{'read_json'} = sub {
 
 	my $json_text = do {
 	 open(my $json_fh, "<:encoding(UTF-8)", $json_filename)
-	    or die("Can't open \$lpd_filename\": $!\n");
+	    or die("Can't open \$json_filename\": $!\n");
 	 local $/;
 	 <$json_fh>
 	};
